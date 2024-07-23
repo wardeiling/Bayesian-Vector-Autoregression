@@ -1,0 +1,579 @@
+---
+title: "Analysis Script"
+author: "Ward B. Eiling"
+date: "19-06-2024"
+output: html
+execute:
+  message: false
+  warning: false
+---
+
+In this script, we will estimate a Bayesian VAR(1) model using both frequentist and Bayesian methods. We will use the `vars` package for frequentist estimation and the `rjags` package for Bayesian estimation. We will also simulate data from a bivariate VAR(1) model to demonstrate the estimation methods.
+
+Loading the necessary packages
+
+```{r}
+library(tidyverse) # for data manipulation and visualizing the results
+library(vars) # for frequentist estimation of VAR models
+library(MASS)    # For mvrnorm
+library(MCMCpack) # for rwish
+library(Matrix)  # For matrix operations
+library(gridExtra) # for arranging plots
+library(mvtnorm) # for dmvnorm
+library(CholWishart) # for dWishart (with log option)
+```
+
+## Preparing the Data
+
+### Real Data
+
+Data file may be retrieved from https://osf.io/j4fg8/
+
+```{r}
+# Loading data
+data <- read.delim("ESMdata.txt")
+
+# Insert rows for missing beeps
+data$date <- as.Date(data$date, format = "%d/%m/%y") # Convert date column to date format
+c_data <- complete(data, date = seq(min(data$date), max(data$date), by = "day"), beepno = 1:10) # Use complete function to add missing rows
+
+# Select five variables and create lagged variants
+psych_data <- c_data %>% 
+  dplyr::select(mood_satisfi, pat_restl)
+
+# Exclude rows with missing values
+psych_data <- psych_data[complete.cases(psych_data), ]
+
+# Convert dataframe into matrix
+psych_data_matrix <- as.matrix(psych_data)
+
+# Create a subset of the first 100 observations
+psych_subset_matrix <- psych_data_matrix[1:100,]
+```
+
+To fix the issues apparent in the ultimate convergence and specification of model 3, we could have used more informative hyperparameters based on our prior beliefs:
+
+In general, it is expected that satisfaction has a greater mean/intercept than restlessness and that autoregressive effects are greater than the cross-lagged effects, both around 0.2.
+In addition, is hypothesized that both cross-lagged effects (i.e., the one of satisfaction in mood on restless and restless on satisfaction in mood) are small and negative: -0.1. Furthermore, we expect that satisfaction has a greater mean/intercept than restlessness and with a 5-point scale, they are expected to be 3 and 1.5 respectively.
+
+Accordingly for matrix A, we assume that
+
+$$\mathbf{A} = \begin{bmatrix} c_1 & c_2 \\ a_{11} & a_{21} \\ a_{12} & a_{22} \end{bmatrix} = \begin{bmatrix} 3 & 1.5 \\ 0.2 & -0.1 \\ -0.1 & 0.2 \end{bmatrix}$$
+
+```{r}
+A_expected <- matrix(c(3, 1.5, 0.2, -0.1, -0.1, 0.2), nrow = 3, byrow = TRUE)
+```
+
+These prior beliefs could have been employed for formulating the hyperparameters of the prior distributions in the Bayesian VAR(1) model (which was not done for the final report due to time constraints).
+
+### Simulated data
+
+```{r}
+# Function to simulate data from a bivariate VAR(1) model
+simulate_bvar1 <- function(n, A, Sigma, C) {
+  p <- ncol(A)
+  Y <- matrix(0, nrow = n, ncol = p)
+  
+  # Generate initial values from a multivariate normal distribution
+  Y[1, ] <- mvrnorm(1, mu = rep(0, p), Sigma)
+  
+  # Simulate data iteratively
+  for (i in 2:n) {
+    Y[i, ] <- C + Y[i - 1, ] %*% t(A) + mvrnorm(1, mu = rep(0, p), Sigma)
+  }
+  
+  return(Y)
+}
+
+# True parameters
+set.seed(123)
+C_true <- c(0.5, 0)  # Intercept vector: c1, c2
+A_true <- matrix(c(0.8, 0.2, 0.1, 0.7), nrow = 2, byrow = TRUE)  # Autoregressive matrix: a11, a12, a21, a22
+Sigma_true <- matrix(c(1, 0.5, 0.5, 1), nrow = 2, byrow = TRUE)  # Covariance matrix (residuals are dependent)
+
+# Simulate data
+Y_sim <- simulate_bvar1(n = 1000, # Number of observations
+                        A = A_true, 
+                        Sigma = Sigma_true,
+                        C = C_true)
+
+Y_sim_df <- data.frame(Y_sim)
+colnames(Y_sim_df) <- c("y1", "y2")
+
+# Plot simulated data
+plot(Y_sim_df$y1, type = 'l', col = 'blue', xlab = 'Time', ylab = 'Value', main = 'Simulated Data - Series 1')
+lines(Y_sim_df$y2, col = 'red')
+legend("topright", legend = c("Series 1", "Series 2"), col = c("blue", "red"), lty = 1)
+```
+
+## Estimation
+
+### Frequentist Estimator: `vars` package
+
+```{r}
+# Estimate a VAR(1) model
+freq_var_model <- vars::VAR(psych_subset_matrix, p = 1, type = "const")
+summary(freq_var_model)
+```
+
+### Frequentist Estimator: Matrix Algebra
+
+```{r}
+Y_matrix <- psych_subset_matrix
+
+# Prepare the data
+n <- nrow(Y_matrix) # Number of observations
+X <- cbind(1, Y_matrix[1:(n-1), ]) # Add a constant
+colnames(X) <- c("const", "mood_satifi_lag1", "pat_restl_lag1")
+Y <- Y_matrix[2:n, ] # Response variables
+
+TT <- nrow(Y) # Number of observations of time series
+M <- ncol(Y) # Number of endogenous variables
+K <- ncol(X) # Number of coefficients in each equation
+
+# Compute ML estimator of A (Frequentist)
+A_OLS <- solve(t(X) %*% X) %*% (t(X) %*% Y)
+round(A_OLS, 3)
+
+# Compute ML estimator of Sigma (Frequentist)
+SSE <- t(Y - X %*% A_OLS) %*% (Y - X %*% A_OLS)
+SIGMA_OLS <- SSE / (TT - K + 1)
+round(SIGMA_OLS, 3)
+```
+
+The frequentist estimators using matrix algebra are identical to those obtained using the `vars` package.
+
+### Bayesian Estimator: Base R
+
+The VAR(p) model is specified as follows
+
+$$\mathbf{y}_t = \mathbf{C} + \sum_{i=1}^{p} \mathbf{A}_i \mathbf{y}_{t-i} + \pmb{\epsilon}_t$$ To assist with the set-up of the model, we may rewrite it and want to define the following matrices
+
+$$Y_t = A X_{t} + \epsilon_t$$ where $Y_t$ is the matrix of endogenous variables, $A$ is the matrix of coefficients, $X_t$ is the matrix of regressors for the model, and $\epsilon_t$ is the vector of residuals, where $\epsilon_t \sim N(0, \Sigma)$. This is a more compact form, where the lags of the endogenous variables and the constant are already included in the matrix $X_t$.
+
+```{r}
+Bayesian_Bivariate_VAR1 <- function(Y_matrix, iter = 30000, burnin = 10000, seed = 12345, prior = 1, plot = FALSE, chains = 2, marginal_likelihood = FALSE, save_plot = FALSE){
+  
+  ######### Function Description #########
+  
+  # This function estimates a Bayesian Bivariate VAR(1) model using M-C Integration 
+  # or Gibbs Sampling. The function estimates the model using the data Y as input.
+  # The function returns posterior draws of the coefficients and the error covariance 
+  # matrix, including relevant statistics and plots.
+  
+  ######### Argument Description #########
+  
+  # Argument              Description
+  # --------              -------------------------------------------------------
+  # Y_matrix              A T x K matrix of variables, where K = 2
+  # chains                Number of chains to run
+  # iter                  Number of iterations of the sampler per chain
+  # burnin                Number of burn-in draws per chain
+  # seed                  Seed for the random number generator
+  # prior                 Prior specification (see description below)
+  # plot                  Logical; plot the traces, densities and autocorrelations functions.
+  # marginal_likelihood   Logical; compute the marginal likelihood using the Harmonic Mean Estimator
+  # save_plot             Logical; save the plots as a png file
+  
+  ######### Priors Description #########
+  
+  # Prior                                     Type
+  # --------------------------------------    -----------------
+  # prior = 1 "Diffuse" ('Jeffreys')          (M-C Integration)       
+  # prior = 2 "Normal-Wishart"                (M-C Integration)          
+  # prior = 3 "Independent Normal-Wishart"    (Gibbs sampler)
+  
+  # The first two priors are initialized with analytical results 
+  # and will therefore not have any convergences issues. Hence,
+  # burn-in is also not strictly necessary for these priors.
+  
+  ######### Preliminaries #########
+  
+  # Prepare the data
+  n <- nrow(Y_matrix) # Number of observations
+  X <- cbind(1, Y_matrix[1:(n-1), ]) # Add a constant
+  Y <- Y_matrix[2:n, ] # Response variables
+  
+  TT <- nrow(Y) # Number of observations of time series
+  M <- ncol(Y) # Number of endogenous variables
+  K <- ncol(X) # Number of coefficients in each equation
+  Z <- kronecker(diag(M), X) # Block-diagonal matrix
+  store <- iter - burnin # Number of stored draws
+  
+  # Compute ML estimator of A (Frequentist)
+  A_OLS <- solve(t(X) %*% X) %*% (t(X) %*% Y)
+  a_OLS <- as.vector(A_OLS)
+  
+  # Compute ML estimator of Sigma (Frequentist)
+  SSE <- t(Y - X %*% A_OLS) %*% (Y - X %*% A_OLS)
+  SIGMA_OLS <- SSE / (TT - K + 1)
+  
+  # Initialize Bayesian posterior parameters using OLS estimates
+  alpha <- as.vector(A_OLS)     # This is the single draw from the posterior of alpha
+  ALPHA <- A_OLS                # This is the single draw from the posterior of ALPHA
+  SSE_Gibbs <- SSE              # This is the SSE based on each draw of ALPHA
+  SIGMA <- SIGMA_OLS            # This is the single draw from the posterior of SIGMA
+  SIGMA_inv <- solve(SIGMA)     # Inverse of SIGMA
+  
+  ######### Define Priors #########
+  
+  if (prior == 1) { ### Diffuse prior
+    
+    # No hyperparameters to specify: posterior depends on OLS estimates
+    
+  } else if (prior == 2) { ### Normal-Wishart prior
+    
+    # Hyperparameters on a ~ N(a_prior, SIGMA x V_prior)
+    A_prior <- matrix(0, nrow = K, ncol = M)  # Prior mean of ALPHA (parameter matrix)
+    # A_prior <- A_expected
+    a_prior <- as.vector(A_prior)             # Prior mean of alpha (parameter vector)
+    V_prior <- 10 * diag(K)                   # Prior variance of alpha
+    
+    # Hyperparameters on inv(SIGMA) ~ W(v_prior,inv(S_prior))
+    v_prior <- M + 1  # Prior degrees of freedom of SIGMA
+    S_prior <- diag(M)  # Prior scale of SIGMA
+    inv_S_prior <- solve(S_prior)
+    
+  } else if (prior == 3) { ### Independent Normal-Wishart prior
+    
+    # Hyperparameters of a
+    n <- K * M  # Total number of parameters (size of vector alpha)
+    a_prior <- matrix(0, nrow = n, ncol = 1)  # Prior mean of alpha (parameter vector)
+    # a_prior <- as.vector(A_expected)
+    V_prior <- 10 * diag(n)  # Prior variance of alpha
+    
+    # Hyperparameters on inv(SIGMA) ~ W(v_prior,inv(S_prior)
+    v_prior <- M + 1  # Prior degrees of freedom of SIGMA
+    S_prior <- diag(M)  # Prior scale of SIGMA
+    inv_S_prior <- solve(S_prior)
+  }
+  
+  ######### Define the likelihood function #########
+  
+  log_likelihood <- function(Y, X, ALPHA, SIGMA) {
+    M <- ncol(Y)
+    TT <- nrow(Y)
+    residuals <- Y - X %*% ALPHA
+    log_lik <- sum(dmvnorm(residuals, sigma = SIGMA, log = TRUE))
+    return(log_lik)
+  }
+  
+  ######### Initialize Chains #########
+  
+  # Create an empty list to store results from each chain
+  all_results <- vector("list", chains)
+  
+  if(marginal_likelihood == TRUE){
+    harmonic_mean <- rep(NA, chains)
+    log_marginal_likelihood <- rep(NA, chains)
+  }
+  
+  
+  # Iterate through each chain
+  for (chain in 1:chains){
+    
+    # Reset random number generator for reproducibility
+    set.seed(seed + chain)
+    
+    # Storage space for posterior draws
+    alpha_draws <- matrix(NA, store, K * M)
+    sigma_draws <- matrix(NA, store, M * M)
+    
+    # Storage for likelihood values
+    if(marginal_likelihood == TRUE){
+      log_likelihoods <- numeric(store)
+    }
+  
+    ######### Start Sampling #########
+    
+    for (draw in 1:iter){
+      
+      if (prior == 1) { ### Diffuse prior
+        
+        # Posterior of alpha|SIGMA,Data ~ Normal
+        V_post <- kronecker(SIGMA, solve(t(X) %*% X))
+        alpha <- a_OLS + t(chol(V_post)) %*% rnorm(K * M)
+        ALPHA <- matrix(alpha, K, M)
+        
+        # Posterior of SIGMA|Data ~ iW(SSE_Gibbs,TT-K)
+        SIGMA_inv <- rwish(v = TT - K, S = solve(SSE_Gibbs))
+        SIGMA <- solve(SIGMA_inv)
+        
+      } else if (prior == 2) { ### Normal-Wishart prior
+        
+        # Get all the required quantities for the posteriors
+        V_post <- solve(solve(V_prior) + t(X) %*% X)
+        A_post <- V_post %*% (solve(V_prior) %*% A_prior + t(X) %*% X %*% A_OLS)
+        a_post <- as.vector(A_post)
+        
+        S_post <- SSE + S_prior + t(A_OLS) %*% t(X) %*% X %*% A_OLS + t(A_prior) %*% solve(V_prior) %*% A_prior - t(A_post) %*% (solve(V_prior) + t(X) %*% X) %*% A_post
+        v_post <- TT + v_prior
+        
+        # This is the covariance for the posterior density of alpha
+        COV <- kronecker(SIGMA, V_post)
+        
+        # Posterior of alpha|SIGMA,Data ~ Normal
+        alpha <- a_post + t(chol(COV)) %*% rnorm(K * M)
+        ALPHA <- matrix(alpha, K, M)
+        
+        # Posterior of SIGMA|ALPHA,Data ~ iW(inv(S_post),v_post)
+        SIGMA_inv <- rwish(v = v_post, S = solve(S_post))
+        SIGMA <- solve(SIGMA_inv)
+        
+      } else if (prior == 3) { ### Independent Normal-Wishart prior
+        
+        VARIANCE <- kronecker(SIGMA_inv, diag(TT))
+        V_post <- solve(V_prior + t(Z) %*% VARIANCE %*% Z)
+        a_post <- V_post %*% (V_prior %*% a_prior + t(Z) %*% VARIANCE %*% as.vector(Y))
+        alpha <- a_post + t(chol(V_post)) %*% rnorm(K * M)
+        ALPHA <- matrix(alpha, K, M)
+        
+        # Posterior of SIGMA|ALPHA,Data ~ iW(inv(S_post),v_post)
+        v_post <- TT + v_prior
+        S_post <- S_prior + t(Y - X %*% ALPHA) %*% (Y - X %*% ALPHA)
+        SIGMA_inv <- rwish(v = v_post, S = solve(S_post))
+        SIGMA <- solve(SIGMA_inv)
+        }
+    
+      # Store draws
+      if (draw > burnin) {
+        alpha_draws[draw - burnin, ] <- matrix(ALPHA, nrow = 1, ncol = K * M, byrow = TRUE)
+        sigma_draws[draw - burnin, ] <- matrix(SIGMA, nrow = 1, ncol = M * M)
+        if(marginal_likelihood == TRUE){
+          log_likelihoods[draw - burnin] <- log_likelihood(Y, X, ALPHA, SIGMA)
+        }
+      }
+    }
+    
+    # Create a dataframe for the draws of the coefficients
+    draws <- cbind(alpha_draws, sigma_draws)
+    draws_df <- data.frame(draws)
+    colnames(draws_df) <- c("c1", "a11", "a12", "c2", "a21", "a22", "sigma11", "sigma12", "sigma21", "sigma22")
+    draws_df$chain <- chain
+    draws_df$draw <- seq(burnin + 1, iter)
+    
+    # Calculate Harmonic Mean Estimator for marginal likelihood
+    if (marginal_likelihood == TRUE) {
+      harmonic_mean[chain] <- exp(-mean(-log_likelihoods))
+    }
+    
+    # Store the draws from this chain
+    all_results[[chain]] <- list(draws_df = draws_df)
+  }
+  
+  # Create one dataframe with all draws with a column indicating that chain number
+  complete_draws_df <- do.call(rbind, lapply(all_results, function(result) result$draws_df))
+  
+  ######### Extract Results #########
+
+  #### Summary measures of posteriors (mean, sd, quantiles for 95% credible interval)
+
+  # Function to summarize posterior draws
+  summarize_posterior <- function(draws){
+    c(round(mean(draws), 3), round(sd(draws), 3), round(quantile(draws, c(0.025, 0.5, 0.975)), 3), round(sd(draws)/(store*chains), 5))
+  }
+
+  a11 <- summarize_posterior(complete_draws_df$a11)
+  a12 <- summarize_posterior(complete_draws_df$a12)
+  a21 <- summarize_posterior(complete_draws_df$a21)
+  a22 <- summarize_posterior(complete_draws_df$a22)
+
+  c1 <- summarize_posterior(complete_draws_df$c1)
+  c2 <- summarize_posterior(complete_draws_df$c2)
+
+  sigma11 <- summarize_posterior(complete_draws_df$sigma11)
+  sigma12 <- summarize_posterior(complete_draws_df$sigma12)
+  sigma21 <- summarize_posterior(complete_draws_df$sigma21)
+  sigma22 <- summarize_posterior(complete_draws_df$sigma22)
+  
+  coef <- matrix(c(a11, a12, a21, a22, c1, c2, sigma11, sigma12, sigma21, sigma22), nrow = 10, byrow = TRUE)
+  dimnames(coef) <- list(c("a11", "a12", "a21", "a22", "c1", "c2", "sigma11", "sigma12", "sigma21", "sigma22"),
+                         c("Mean", "SD", "2.5%", "50%", "97.5%", "Monte Carlo error"))
+
+  #### Compute Gelman and Rubin statistic
+
+  r_hat_values <- NULL
+  if (chains > 1) {
+    compute_r_hat <- function(parameter_name) {
+      # Extract the parameter draws for each chain
+      chain_draws <- lapply(1:chains, function(chain) {
+        all_results[[chain]]$draws_df[[parameter_name]]
+      })
+      
+      # Number of draws in each chain after burn-in
+      L <- store
+      
+      # Compute the chain means
+      chain_means <- sapply(chain_draws, function(chain) mean(chain))
+      
+      # Compute the grand mean
+      grand_mean <- mean(chain_means)
+      
+      # Compute the between-chain variance B
+      B <- (L / (chains - 1)) * sum((chain_means - grand_mean)^2)
+      
+      # Compute the within-chain variances s^2_j
+      s2_j <- sapply(chain_draws, function(chain) var(chain))
+      
+      # Compute the within-chain variance W
+      W <- mean(s2_j)
+      
+      # Compute the Gelman-Rubin statistic R
+      R_hat <- (((L - 1) / L) * W + (1 / L) * B) / W
+      
+      return(R_hat)
+    }
+    
+    r_hat_values <- round(sapply(c("a11", "a12", "a21", "a22", "c1", "c2", "sigma11", "sigma12", "sigma21", "sigma22"), compute_r_hat), 3)
+    names(r_hat_values) <- c("a11", "a12", "a21", "a22", "c1", "c2", "sigma11", "sigma12", "sigma21", "sigma22")
+  } else {
+    warning("Gelman-Rubin diagnostic requires at least two chains.")
+  }
+
+  # Combine summaries and R_hat values into the coef matrix
+  if (!is.null(r_hat_values)) {
+    coef <- cbind(coef, `R_hat` = r_hat_values)
+  }
+
+  ######### Visualize Results #########
+
+  if(plot == TRUE){
+
+    #### Trace plots of each parameter with chains of different colors
+    trace_a11 <- ggplot(complete_draws_df, aes(x = draw, y = a11, color = factor(chain))) + geom_line() + theme_minimal() + ggtitle("Trace Plot of a11")
+    trace_a12 <- ggplot(complete_draws_df, aes(x = draw, y = a12, color = factor(chain))) + geom_line() + theme_minimal() + ggtitle("Trace Plot of a12")
+    trace_a21 <- ggplot(complete_draws_df, aes(x = draw, y = a21, color = factor(chain))) + geom_line() + theme_minimal() + ggtitle("Trace Plot of a21")
+    trace_a22 <- ggplot(complete_draws_df, aes(x = draw, y = a22, color = factor(chain))) + geom_line() + theme_minimal() + ggtitle("Trace Plot of a22")
+    trace_c1 <- ggplot(complete_draws_df, aes(x = draw, y = c1, color = factor(chain))) + geom_line() + theme_minimal() + ggtitle("Trace Plot of c1")
+    trace_c2 <- ggplot(complete_draws_df, aes(x = draw, y = c2, color = factor(chain))) + geom_line() + theme_minimal() + ggtitle("Trace Plot of c2")
+    trace_sigma11 <- ggplot(complete_draws_df, aes(x = draw, y = sigma11, color = factor(chain))) + geom_line() + theme_minimal() + ggtitle("Trace Plot of sigma11")
+    trace_sigma12 <- ggplot(complete_draws_df, aes(x = draw, y = sigma12, color = factor(chain))) + geom_line() + theme_minimal() + ggtitle("Trace Plot of sigma12")
+    trace_sigma21 <- ggplot(complete_draws_df, aes(x = draw, y = sigma21, color = factor(chain))) + geom_line() + theme_minimal() + ggtitle("Trace Plot of sigma21")
+    trace_sigma22 <- ggplot(complete_draws_df, aes(x = draw, y = sigma22, color = factor(chain))) + geom_line() + theme_minimal() + ggtitle("Trace Plot of sigma22")
+
+    traceplots <- list(trace_a11, trace_a12, trace_a21, trace_a22, trace_c1, trace_c2, trace_sigma11, trace_sigma12, trace_sigma21, trace_sigma22)
+
+    all_traceplots <- grid.arrange(grobs = traceplots, ncol = 2)
+    
+    if(save_plot == TRUE){
+      ggsave(paste0("traceplots_model", prior, ".png"), all_traceplots, width = 11, height = 14)
+    }
+
+    #### Full posterior density for each parameter
+    density_a11 <- ggplot(complete_draws_df, aes(x = a11)) + geom_density() + theme_minimal() + ggtitle("Density Plot of a11")
+    density_a12 <- ggplot(complete_draws_df, aes(x = a12)) + geom_density() + theme_minimal() + ggtitle("Density Plot of a12")
+    density_a21 <- ggplot(complete_draws_df, aes(x = a21)) + geom_density() + theme_minimal() + ggtitle("Density Plot of a21")
+    density_a22 <- ggplot(complete_draws_df, aes(x = a22)) + geom_density() + theme_minimal() + ggtitle("Density Plot of a22")
+    density_c1 <- ggplot(complete_draws_df, aes(x = c1)) + geom_density() + theme_minimal() + ggtitle("Density Plot of c1")
+    density_c2 <- ggplot(complete_draws_df, aes(x = c2)) + geom_density() + theme_minimal() + ggtitle("Density Plot of c2")
+    density_sigma11 <- ggplot(complete_draws_df, aes(x = sigma11)) + geom_density() + theme_minimal() + ggtitle("Density Plot of sigma11")
+    density_sigma12 <- ggplot(complete_draws_df, aes(x = sigma12)) + geom_density() + theme_minimal() + ggtitle("Density Plot of sigma12")
+    density_sigma21 <- ggplot(complete_draws_df, aes(x = sigma21)) + geom_density() + theme_minimal() + ggtitle("Density Plot of sigma21")
+    density_sigma22 <- ggplot(complete_draws_df, aes(x = sigma22)) + geom_density() + theme_minimal() + ggtitle("Density Plot of sigma22")
+
+    densities <- list(density_a11, density_a12, density_a21, density_a22, density_c1, density_c2, density_sigma11, density_sigma12, density_sigma21, density_sigma22)
+
+    all_density_plots <- grid.arrange(grobs = densities, ncol = 2)
+    
+    if(save_plot == TRUE){
+      ggsave(paste0("density_plots_model", prior, ".png"), all_density_plots, width = 11, height = 14)
+    }
+    
+    if(save_plot == TRUE){
+      png(paste0("acf_plots_model", prior, ".png"), width = 2750, height = 3500, res = 300)
+    }
+
+    par(mfrow = c(5, 2))
+    acf_a11 <- acf(complete_draws_df$a11, lag.max = 20, plot = T, main = "ACF of a11")
+    acf_a12 <- acf(complete_draws_df$a12, lag.max = 20, plot = T, main = "ACF of a12")
+    acf_a21 <- acf(complete_draws_df$a21, lag.max = 20, plot = T, main = "ACF of a21")
+    acf_a22 <- acf(complete_draws_df$a22, lag.max = 20, plot = T, main = "ACF of a22")
+    acf_c1 <- acf(complete_draws_df$c1, lag.max = 20, plot = T, main = "ACF of c1")
+    acf_c2 <- acf(complete_draws_df$c2, lag.max = 20, plot = T, main = "ACF of c2")
+    acf_sigma11 <- acf(complete_draws_df$sigma11, lag.max = 20, plot = T, main = "ACF of sigma11")
+    acf_sigma12 <- acf(complete_draws_df$sigma12, lag.max = 20, plot = T, main = "ACF of sigma12")
+    acf_sigma21 <- acf(complete_draws_df$sigma21, lag.max = 20, plot = T, main = "ACF of sigma21")
+    acf_sigma22 <- acf(complete_draws_df$sigma22, lag.max = 20, plot = T, main = "ACF of sigma22")
+  }
+  
+  if(save_plot == TRUE){
+    dev.off()
+  }
+  
+  return(list(coef = coef, complete_draws_df = complete_draws_df, marginal_likelihood = harmonic_mean))
+}
+```
+
+Let us run the model with the three different priors and assess the trace plots, density plots and autocorrelation functions.
+
+```{r,  fig.width = 11, fig.height = 14}
+model1 <- Bayesian_Bivariate_VAR1(Y_matrix = psych_subset_matrix, iter = 10000, burnin = 0, seed = 1234567, prior = 1, chains = 2, plot = T, marginal_likelihood = T, save_plot = T)
+```
+
+```{r,  fig.width = 11, fig.height = 14}
+model2 <- Bayesian_Bivariate_VAR1(Y_matrix = psych_subset_matrix, iter = 10000, burnin = 0, seed = 1234567, prior = 2, chains = 2, plot = T, marginal_likelihood = T, save_plot = T)
+```
+
+```{r,  fig.width = 11, fig.height = 14}
+model3 <- Bayesian_Bivariate_VAR1(Y_matrix = psych_subset_matrix, iter = 15000, burnin = 5000, seed = 1234567, prior = 3, chains = 2, plot = T, marginal_likelihood = T, save_plot = T)
+```
+
+Let us now assess the results of the three models by comparing the posterior means of the coefficients with the OLS estimates.
+
+```{r}
+model1$coef
+model2$coef
+model3$coef
+round(A_OLS, 3)
+```
+
+```{r, echo = FALSE}
+# save these coef objects
+saveRDS(model1$coef, "model1_coef.rds")
+saveRDS(model2$coef, "model2_coef.rds")
+saveRDS(model3$coef, "model3_coef.rds")
+```
+
+Let us check if the Monte-Carlo error is smaller than 5% of the sample SD for each parameter in each model
+
+```{r}
+model1$coef[, "Monte Carlo error"] < 0.05 * model1$coef[, "SD"]
+model2$coef[, "Monte Carlo error"] < 0.05 * model2$coef[, "SD"]
+model3$coef[, "Monte Carlo error"] < 0.05 * model3$coef[, "SD"]
+```
+
+
+```{r, echo = FALSE}
+saveRDS(model1, "model1_10000iter.rds")
+saveRDS(model2, "model2_10000iter.rds")
+saveRDS(model3, "model3_5000-15000iter.rds")
+```
+
+## Performing Bayesian hypothesis testing / Model selection
+
+Let us compute the Bayes Factor to compare the evidence given the data presented by the marginal likelihoods as obtained by the Harmonic Mean Estimator
+
+```{r}
+BF_12 <- model1$marginal_likelihood / model2$marginal_likelihood
+BF_13 <- model1$marginal_likelihood / model3$marginal_likelihood
+BF_23 <- model2$marginal_likelihood / model3$marginal_likelihood
+
+BF <- data.frame(BF_12 = BF_12, BF_13 = BF_13, BF_23 = BF_23)
+rownames(BF) <- c("chain 1", "chain 2")
+BF
+```
+
+```{r, echo = FALSE}
+saveRDS(BF, "BF.rds")
+```
+
+# Resources:
+
+-   Chib, S. (1995). Marginal Likelihood from the Gibbs Output. Journal of the American Statistical Association, 90(432), 1313–1321. https://doi.org/10.2307/2291521
+-   Karlsson, S. (2012). Forecasting with Bayesian Vector Autoregressions (Working Paper 2012:12). Örebro University, School of Business. https://econpapers.repec.org/paper/hhsoruesi/2012_5f012.htm
+-   Koop, G., & Korobilis, D. (2010). Bayesian Multivariate Time Series Methods for Empirical Macroeconomics. Foundations and Trends® in Econometrics, 3(4), 267–358. https://doi.org/10.1561/0800000013
+-   https://kevinkotze.github.io/tss-9-bvar/
+-   https://www.r-econometrics.com/timeseries/varintro/
+-   https://www.r-econometrics.com/timeseries/bvar/
+-   https://kevinkotze.github.io/ts-9-tut/
+-   https://www.youtube.com/watch?v=kos9yzhvL1I
